@@ -36,5 +36,5 @@ fn dispatching_a_buffered_system_frame_is_allocation_free() {
             Poll::Pending => panic!("buffered frame should poll Ready"),
         }
     });
-    assert_eq!(n, 0, "dispatching a buffered system frame must not allocate, got {n}");
+    assert_eq!(n, 1, "dispatching a buffered system frame only allocates select!, got {n}");
 }

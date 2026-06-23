@@ -39,6 +39,20 @@ impl Inbound {
     ///
     /// The `biased` keyword polls `sys` first so a system frame preempts any
     /// data backlog deterministically.
+    /// Drain everything currently queued on the data lane. Frames where
+    /// `survives_flush()` is false are dropped; survivors are returned in the
+    /// order they arrived, for the caller to re-process. Does not block and does
+    /// not touch the sys lane.
+    pub fn flush_data(&mut self) -> Vec<DataFrame> {
+        let mut kept = Vec::new();
+        while let Ok(frame) = self.data.try_recv() {
+            if frame.survives_flush() {
+                kept.push(frame);
+            }
+        }
+        kept
+    }
+
     pub async fn recv(&mut self) -> Option<Received> {
         tokio::select! {
             biased;

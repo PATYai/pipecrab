@@ -52,10 +52,44 @@ pub enum SystemFrame {
 /// produce a new one when you're ready.
 #[derive(Clone, Debug)]
 pub enum DataFrame {
+    /// Input audio from a transport source. Survives an interrupt flush so that
+    /// a barge-in utterance is not clipped; see [`DataFrame::survives_flush`].
+    InputAudio {
+        /// Raw PCM bytes.
+        bytes: Arc<[u8]>,
+        /// Samples per second (e.g. 16 000 for 16 kHz).
+        sample_rate: u32,
+        /// Number of audio channels (1 = mono, 2 = stereo).
+        num_channels: u16,
+    },
     /// A text transcript segment (ASR output or TTS input).
     Transcript(Arc<str>),
     /// A raw audio chunk (PCM bytes, format negotiated out-of-band).
     Audio(Arc<[u8]>),
     /// Application-defined payload; see [`CustomFrame`].
     Custom(Arc<dyn CustomFrame>),
+}
+
+impl DataFrame {
+    /// True for frames that must survive an interrupt's data-queue flush —
+    /// input-from-transport media, since a barge-in utterance must not be
+    /// clipped. False for everything else.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use pipecrab_core::DataFrame;
+    ///
+    /// let input = DataFrame::InputAudio {
+    ///     bytes: Arc::from(&[0u8; 4][..]),
+    ///     sample_rate: 16_000,
+    ///     num_channels: 1,
+    /// };
+    /// assert!(input.survives_flush());
+    ///
+    /// assert!(!DataFrame::Transcript("hi".into()).survives_flush());
+    /// assert!(!DataFrame::Audio(Arc::from(&[][..])).survives_flush());
+    /// ```
+    pub fn survives_flush(&self) -> bool {
+        matches!(self, DataFrame::InputAudio { .. })
+    }
 }

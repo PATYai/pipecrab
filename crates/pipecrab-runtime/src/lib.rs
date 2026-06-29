@@ -10,5 +10,8 @@
 pub mod inbound;
 /// Typed send surface for a stage's output channels.
 pub mod outbound;
+/// The [`Stage`] trait and its [`StageError`].
+pub mod stage;
 pub use inbound::{Inbound, Received};
 pub use outbound::Outbound;
+pub use stage::{Stage, StageError};

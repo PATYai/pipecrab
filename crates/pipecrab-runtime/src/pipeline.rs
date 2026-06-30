@@ -1,54 +1,64 @@
-//! [`Pipeline`]: wires a sequence of [`Stage`]s into one runnable, preemptible
-//! future.
+//! [`Pipeline`]: a sequence of [`Stage`]s that is itself a [`Stage`].
+//!
+//! A pipeline *is* a stage ([`impl Stage for Pipeline`](Pipeline#impl-Stage-for-Pipeline)),
+//! so pipelines nest: add one to another builder with
+//! [`PipelineBuilder::stage`]. It reuses the same [`Inbound`] / [`Outbound`]
+//! abstraction every stage connects through — no bespoke channel types in the
+//! public surface.
 //!
 //! # Topology (v1)
 //!
-//! Both lanes form a linear downstream chain: an external `data_in`/`sys_in`
-//! feeds stage 0, each stage's output feeds the next, and the tail's output is
-//! the external `data_out`/`sys_out`. Adjacent stages are joined by a `data`
-//! channel, and the `sys` lane is threaded through every stage the same way, so
-//! a control frame visits each stage in turn. Closing the inputs therefore
-//! cascades shutdown cleanly from head to tail.
+//! Both lanes form a linear downstream chain, wired at [`run`](Stage::run)
+//! time: the `inbound` handed to the pipeline feeds stage 0, each stage's
+//! output feeds the next via [`link`], and the tail's output is the pipeline's
+//! `out`. The `sys` lane is threaded through every stage the same way, so a
+//! control frame visits each stage in turn, and closing the input cascades
+//! shutdown from head to tail.
 //!
-//! Upstream routing of `Up`-travelling system frames *through* the stages
-//! (e.g. an `Error` flowing back toward the source) is not yet wired: for now a
-//! [`Stage::perform`] error is surfaced on the tail's `sys_out`, tagged
-//! [`Direction::Up`]. That is a deliberate v1 limitation.
+//! Upstream routing of `Up`-travelling system frames *through* the stages is
+//! not yet wired: a [`Stage::perform`] error surfaces on the tail's output,
+//! tagged [`Direction::Up`]. That is a deliberate v1 limitation.
 //!
 //! # Driving it
 //!
-//! [`Pipeline::run`] is a single future that drives every stage's run loop
-//! cooperatively via [`FuturesUnordered`]; there is no spawning and no executor
-//! trait. The caller drives it — `block_on` natively, `spawn_local` in the
-//! browser.
+//! [`Pipeline::start`] wires fresh external [`PipelineEnds`] and hands back the
+//! driving future. The caller drives it — `block_on` natively, `spawn_local` in
+//! the browser; there is no spawning and no executor trait.
 
+use async_trait::async_trait;
 use futures::channel::mpsc;
-use futures::future::FutureExt;
-use futures::pin_mut;
+use futures::future::LocalBoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
-use pipecrab_core::{DataFrame, Direction, Disposition, SystemFrame};
+use pipecrab_core::{DataFrame, Decision, Direction, Processor, SystemFrame};
 
-use crate::{Inbound, Outbound, Received, Stage, StageError};
+use crate::{Inbound, Outbound, Stage, StageError};
 
-/// Default capacity for each inter-stage lane channel.
+/// Default buffer depth for each lane channel: how many frames may queue on a
+/// lane before a send awaits (backpressure). Arbitrary-but-reasonable, not a
+/// convention; tune it with [`PipelineBuilder::capacity`].
 const DEFAULT_CAPACITY: usize = 16;
 
-/// The external endpoints of a built [`Pipeline`]: feed the head, read the tail.
+/// Create a linked [`Outbound`] / [`Inbound`] pair sharing one data channel and
+/// one system channel: frames sent on the `Outbound` are received on the
+/// `Inbound`. This is the single wiring primitive — pipelines use it between
+/// adjacent stages and at their external ends.
+pub fn link(capacity: usize) -> (Outbound, Inbound) {
+    let capacity = capacity.max(1);
+    let (data_tx, data_rx) = mpsc::channel::<DataFrame>(capacity);
+    let (sys_tx, sys_rx) = mpsc::channel::<(Direction, SystemFrame)>(capacity);
+    (Outbound { data: data_tx, sys: sys_tx }, Inbound { sys: sys_rx, data: data_rx })
+}
+
+/// The external endpoints of a running [`Pipeline`]: send in via `input`, read
+/// out via `output` — the same [`Outbound`] / [`Inbound`] every stage uses.
 ///
-/// Returned alongside the pipeline from [`PipelineBuilder::build`]. The caller
-/// holds these while [`Pipeline::run`] consumes the pipeline itself. Dropping
-/// both input senders closes the head's inbound lanes, which cascades shutdown
-/// downstream and lets `run` return.
+/// Returned by [`Pipeline::start`]. Dropping `input` closes the head's inbound
+/// lanes, which cascades shutdown downstream and lets the driver finish.
 pub struct PipelineEnds {
-    /// Sends data frames into the head stage's data lane.
-    pub data_in: mpsc::Sender<DataFrame>,
-    /// Sends system frames into the head stage's system lane.
-    pub sys_in: mpsc::Sender<(Direction, SystemFrame)>,
-    /// Receives data frames emitted past the tail stage.
-    pub data_out: mpsc::Receiver<DataFrame>,
-    /// Receives system frames emitted past the tail stage (including
-    /// [`Direction::Up`]-tagged errors from any stage's `perform`).
-    pub sys_out: mpsc::Receiver<(Direction, SystemFrame)>,
+    /// Send data and system frames into the head of the pipeline.
+    pub input: Outbound,
+    /// Receive data and system frames emitted past the tail of the pipeline.
+    pub output: Inbound,
 }
 
 /// Builds a [`Pipeline`] from an ordered list of stages sharing one `Effect`.
@@ -63,13 +73,15 @@ impl<E: 'static> PipelineBuilder<E> {
         Self { stages: Vec::new(), capacity: DEFAULT_CAPACITY }
     }
 
-    /// Override the per-lane channel capacity (clamped to at least 1).
+    /// Override the per-lane buffer depth — how many frames may queue on a lane
+    /// before a send awaits (backpressure). Clamped to at least 1.
     pub fn capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity.max(1);
         self
     }
 
-    /// Append a stage, boxing it. Stages run in the order added, head first.
+    /// Append a stage, boxing it. Stages run in the order added, head first. A
+    /// [`Pipeline`] is itself a stage, so it may be passed here to nest.
     pub fn stage(mut self, stage: impl Stage<Effect = E> + 'static) -> Self {
         self.stages.push(Box::new(stage));
         self
@@ -81,36 +93,14 @@ impl<E: 'static> PipelineBuilder<E> {
         self
     }
 
-    /// Wire the stages into a runnable [`Pipeline`] and its external
-    /// [`PipelineEnds`].
+    /// Finish building.
     ///
     /// # Panics
     ///
     /// Panics if no stages were added — a pipeline needs at least one stage.
-    pub fn build(self) -> (PipelineEnds, Pipeline<E>) {
+    pub fn build(self) -> Pipeline<E> {
         assert!(!self.stages.is_empty(), "a pipeline needs at least one stage");
-        let cap = self.capacity;
-
-        // `prev_*_rx` starts as the external input's receiver and, after the
-        // loop, ends up as the tail's output receiver — the external output.
-        let (data_in, mut prev_data_rx) = mpsc::channel::<DataFrame>(cap);
-        let (sys_in, mut prev_sys_rx) = mpsc::channel::<(Direction, SystemFrame)>(cap);
-
-        let mut cells = Vec::with_capacity(self.stages.len());
-        for stage in self.stages {
-            let (data_tx, next_data_rx) = mpsc::channel::<DataFrame>(cap);
-            let (sys_tx, next_sys_rx) = mpsc::channel::<(Direction, SystemFrame)>(cap);
-            cells.push(StageCell {
-                stage,
-                inbound: Inbound { sys: prev_sys_rx, data: prev_data_rx },
-                out: Outbound { data: data_tx, sys: sys_tx },
-            });
-            prev_data_rx = next_data_rx;
-            prev_sys_rx = next_sys_rx;
-        }
-
-        let ends = PipelineEnds { data_in, sys_in, data_out: prev_data_rx, sys_out: prev_sys_rx };
-        (ends, Pipeline { cells })
+        Pipeline { stages: self.stages, capacity: self.capacity }
     }
 }
 
@@ -120,147 +110,73 @@ impl<E: 'static> Default for PipelineBuilder<E> {
     }
 }
 
-/// A wired pipeline: a sequence of stages plus their channels, ready to [`run`].
+/// A sequence of stages, itself a [`Stage`]. Wired and driven by [`start`] (at
+/// the top level) or by a parent pipeline's [`run`](Stage::run) (when nested).
 ///
-/// [`run`]: Pipeline::run
+/// [`start`]: Pipeline::start
 pub struct Pipeline<E> {
-    cells: Vec<StageCell<E>>,
-}
-
-struct StageCell<E> {
-    stage: Box<dyn Stage<Effect = E>>,
-    inbound: Inbound,
-    out: Outbound,
+    stages: Vec<Box<dyn Stage<Effect = E>>>,
+    capacity: usize,
 }
 
 impl<E: 'static> Pipeline<E> {
-    /// Drive every stage's run loop to completion as one cooperative future.
-    ///
-    /// Returns once all stages have shut down (their inbound lanes closed). No
-    /// spawning happens here — the caller drives the returned future.
-    pub async fn run(self) {
-        let mut tasks: FuturesUnordered<_> =
-            self.cells.into_iter().map(|c| run_stage(c.stage, c.inbound, c.out)).collect();
+    /// Wire fresh external [`PipelineEnds`] and return them with the driving
+    /// future. The caller drives the future (e.g. `block_on`) and uses the ends
+    /// to feed the head and read the tail.
+    pub fn start(self) -> (PipelineEnds, LocalBoxFuture<'static, ()>) {
+        let capacity = self.capacity;
+        let (input, head_in) = link(capacity);
+        let (tail_out, output) = link(capacity);
+        let driver = Box::new(self).run(head_in, tail_out);
+        (PipelineEnds { input, output }, driver)
+    }
+}
+
+// A pipeline's behavior lives entirely in its overridden `run`, which drives its
+// children. It is never treated as a leaf, so `decide_*` and `perform` are never
+// reached in correct use — they panic as tripwires for misuse (e.g. a custom
+// driver that calls the wrong method). `run` is the one legitimate entry point.
+impl<E> Processor for Pipeline<E> {
+    type Effect = E;
+
+    fn decide_data(&mut self, _frame: &DataFrame) -> Decision<E> {
+        unreachable!("a Pipeline is driven by Stage::run, not decide_data")
+    }
+
+    fn decide_system(&mut self, _dir: Direction, _frame: &SystemFrame) -> Decision<E> {
+        unreachable!("a Pipeline is driven by Stage::run, not decide_system")
+    }
+}
+
+#[async_trait(?Send)]
+impl<E: 'static> Stage for Pipeline<E> {
+    async fn perform(&self, _effect: E, _out: &Outbound) -> Result<(), StageError> {
+        unreachable!("a Pipeline is driven by Stage::run, not perform")
+    }
+
+    /// Wire the children between `inbound` and `out` and drive every child's
+    /// `run` cooperatively as one future via [`FuturesUnordered`].
+    async fn run(self: Box<Self>, inbound: Inbound, out: Outbound) {
+        let Pipeline { stages, capacity } = *self;
+        let n = stages.len();
+        let mut tasks = FuturesUnordered::new();
+
+        // Thread `inbound` into stage 0 and `out` out of the last stage; link
+        // adjacent stages with fresh channels in between.
+        let mut current_in = Some(inbound);
+        let mut final_out = Some(out);
+        for (i, stage) in stages.into_iter().enumerate() {
+            let stage_in = current_in.take().expect("inbound threaded through");
+            let stage_out = if i + 1 == n {
+                final_out.take().expect("outbound threaded through")
+            } else {
+                let (this_out, next_in) = link(capacity);
+                current_in = Some(next_in);
+                this_out
+            };
+            tasks.push(stage.run(stage_in, stage_out));
+        }
+
         while tasks.next().await.is_some() {}
     }
-}
-
-/// The per-stage preemptible run loop.
-///
-/// System frames are drained before data (via [`Inbound::recv`]). While a data
-/// frame's effects run in `perform`, the system lane is raced against them: an
-/// `Interrupt` drops the in-flight `perform` immediately; any other system
-/// frame is stashed and handled once `perform` is dropped (we cannot call the
-/// `&mut self` `decide_system` while `perform` borrows `&self`). The loop ends
-/// when both inbound lanes close, on a `Stop`, or on a fatal error.
-async fn run_stage<E>(mut stage: Box<dyn Stage<Effect = E>>, mut inbound: Inbound, out: Outbound) {
-    while let Some(received) = inbound.recv().await {
-        match received {
-            Received::Sys(dir, frame) => {
-                if handle_system(stage.as_mut(), dir, frame, &out).await {
-                    break;
-                }
-            }
-            Received::Data(frame) => {
-                let decision = stage.decide_data(&frame);
-                if decision.disposition == Disposition::Forward {
-                    let _ = out.send_data(frame).await;
-                }
-                if decision.effects.is_empty() {
-                    continue;
-                }
-
-                let mut stashed: Vec<(Direction, SystemFrame)> = Vec::new();
-                let mut interrupt: Option<(Direction, SystemFrame)> = None;
-                let mut should_stop = false;
-                {
-                    // `perform` borrows `&stage` for its whole lifetime, so no
-                    // `&mut stage` (i.e. no `decide_system`) is possible until it
-                    // is dropped at the end of this block.
-                    let perform = run_effects(stage.as_ref(), decision.effects, &out).fuse();
-                    pin_mut!(perform);
-                    loop {
-                        futures::select_biased! {
-                            maybe = inbound.sys.next() => {
-                                // `None` => sys lane closed; fall through and keep
-                                // awaiting `perform`.
-                                if let Some((d, f)) = maybe {
-                                    if matches!(f, SystemFrame::Interrupt) {
-                                        interrupt = Some((d, f));
-                                        break; // drops `perform`: barge-in
-                                    }
-                                    stashed.push((d, f)); // defer; keep performing
-                                }
-                            },
-                            res = perform => {
-                                if let Err(e) = res {
-                                    let fatal = e.fatal;
-                                    emit_error(&out, e).await;
-                                    should_stop |= fatal;
-                                }
-                                break;
-                            },
-                            complete => break,
-                        }
-                    }
-                }
-
-                // `perform` is dropped; `&mut stage` is free again.
-                for (d, f) in stashed.drain(..) {
-                    should_stop |= handle_system(stage.as_mut(), d, f, &out).await;
-                }
-                if let Some((d, f)) = interrupt {
-                    should_stop |= handle_system(stage.as_mut(), d, f, &out).await;
-                }
-                if should_stop {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Run a system frame through the stage: `decide_system`, forward on `Forward`,
-/// then perform its effects. Returns `true` if the stage should stop (the frame
-/// was a `Stop`, or an effect failed fatally).
-async fn handle_system<E>(
-    stage: &mut dyn Stage<Effect = E>,
-    dir: Direction,
-    frame: SystemFrame,
-    out: &Outbound,
-) -> bool {
-    let mut should_stop = matches!(frame, SystemFrame::Stop);
-    let decision = stage.decide_system(dir, &frame);
-    if decision.disposition == Disposition::Forward {
-        let _ = out.send_system(dir, frame).await;
-    }
-    for effect in decision.effects {
-        if let Err(e) = stage.perform(effect, out).await {
-            let fatal = e.fatal;
-            emit_error(out, e).await;
-            should_stop |= fatal;
-        }
-    }
-    should_stop
-}
-
-/// Perform a stage's effects in order, short-circuiting on the first error.
-async fn run_effects<E>(
-    stage: &dyn Stage<Effect = E>,
-    effects: Vec<E>,
-    out: &Outbound,
-) -> Result<(), StageError> {
-    for effect in effects {
-        stage.perform(effect, out).await?;
-    }
-    Ok(())
-}
-
-/// Surface a `perform` failure as an `Error` system frame. v1 sends it on the
-/// downstream `sys` lane tagged [`Direction::Up`]; true upstream routing is a
-/// follow-up.
-async fn emit_error(out: &Outbound, e: StageError) {
-    let _ = out
-        .send_system(Direction::Up, SystemFrame::Error { message: e.message, fatal: e.fatal })
-        .await;
 }

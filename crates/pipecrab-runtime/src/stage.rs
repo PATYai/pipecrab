@@ -1,4 +1,5 @@
-//! The [`Stage`] trait: the async, effecting half of a pipeline stage.
+//! The [`Stage`] trait: the async, effecting half of a pipeline stage, and the
+//! preemptible run loop ([`Stage::run`]) that drives one.
 //!
 //! A stage is a [`Processor`] — synchronous, state-owning `decide_*` — plus an
 //! async [`Stage::perform`] that interprets the effects `decide_*` emitted and
@@ -6,14 +7,22 @@
 //! `&mut self` and is the *only* place state changes; `perform` takes `&self`
 //! and must never mutate state, so the run loop can drop an in-flight `perform`
 //! future on an interrupt without leaving torn state behind.
+//!
+//! [`Stage::run`] ties a stage to an [`Inbound`] and an [`Outbound`] and drives
+//! it. Its default body is the leaf run loop; a composite stage (a
+//! [`Pipeline`](crate::Pipeline)) overrides it to drive its children — which is
+//! why a pipeline is itself a `Stage` and can nest.
 
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pipecrab_core::Processor;
+use futures::future::FutureExt;
+use futures::pin_mut;
+use futures::stream::StreamExt;
+use pipecrab_core::{Direction, Disposition, Processor, SystemFrame};
 
-use crate::Outbound;
+use crate::{Inbound, Outbound, Received};
 
 /// Why a [`Stage::perform`] call failed.
 ///
@@ -71,6 +80,11 @@ impl From<&str> for StageError {
 /// values; [`perform`](Stage::perform) interprets one effect, does its I/O, and
 /// pushes any resulting frames through `out`.
 ///
+/// [`run`](Stage::run) drives the stage given an [`Inbound`] and an
+/// [`Outbound`]. Its default is the preemptible leaf loop; a composite stage
+/// overrides it (see [`Pipeline`](crate::Pipeline)), which is what lets a
+/// pipeline be a `Stage` and nest inside another.
+///
 /// # `?Send` is deliberate
 ///
 /// pipecrab commits to a single-threaded execution model, so the returned
@@ -95,4 +109,131 @@ pub trait Stage: Processor {
     /// `perform` yields, so never block the thread inline — offload heavy work
     /// and `await` it.
     async fn perform(&self, effect: Self::Effect, out: &Outbound) -> Result<(), StageError>;
+
+    /// Drive this stage to completion: consume frames from `inbound`, emit
+    /// through `out`, return once `inbound` closes (or on `Stop` / a fatal
+    /// error).
+    ///
+    /// The default is the preemptible run loop. System frames are drained
+    /// before data (via [`Inbound::recv`]). While a data frame's effects run in
+    /// `perform`, the system lane is raced against them: an `Interrupt` drops
+    /// the in-flight `perform` immediately; any other system frame is *stashed*
+    /// and handled once `perform` is dropped — we cannot call the `&mut self`
+    /// `decide_system` while `perform` borrows `&self`, so the stash defers it
+    /// until that borrow ends.
+    ///
+    /// A composite stage overrides this; the default body is never invoked for
+    /// one (see [`Pipeline`](crate::Pipeline)).
+    async fn run(self: Box<Self>, inbound: Inbound, out: Outbound) {
+        let mut stage = self;
+        let mut inbound = inbound;
+        while let Some(received) = inbound.recv().await {
+            match received {
+                Received::Sys(dir, frame) => {
+                    if handle_system(&mut *stage, dir, frame, &out).await {
+                        break;
+                    }
+                }
+                Received::Data(frame) => {
+                    let decision = stage.decide_data(&frame);
+                    if decision.disposition == Disposition::Forward {
+                        let _ = out.send_data(frame).await;
+                    }
+                    if decision.effects.is_empty() {
+                        continue;
+                    }
+
+                    let mut stashed: Vec<(Direction, SystemFrame)> = Vec::new();
+                    let mut interrupt: Option<(Direction, SystemFrame)> = None;
+                    let mut should_stop = false;
+                    {
+                        // `perform` borrows `&*stage` for its whole lifetime, so
+                        // no `&mut *stage` (i.e. no `decide_system`) is possible
+                        // until it is dropped at the end of this block.
+                        let perform = run_effects(&*stage, decision.effects, &out).fuse();
+                        pin_mut!(perform);
+                        loop {
+                            futures::select_biased! {
+                                maybe = inbound.sys.next() => {
+                                    // `None` => sys lane closed; keep performing.
+                                    if let Some((d, f)) = maybe {
+                                        if matches!(f, SystemFrame::Interrupt) {
+                                            interrupt = Some((d, f));
+                                            break; // drops `perform`: barge-in
+                                        }
+                                        stashed.push((d, f)); // defer; keep performing
+                                    }
+                                },
+                                res = perform => {
+                                    if let Err(e) = res {
+                                        let fatal = e.fatal;
+                                        emit_error(&out, e).await;
+                                        should_stop |= fatal;
+                                    }
+                                    break;
+                                },
+                                complete => break,
+                            }
+                        }
+                    }
+
+                    // `perform` is dropped; `&mut *stage` is free again.
+                    for (d, f) in stashed.drain(..) {
+                        should_stop |= handle_system(&mut *stage, d, f, &out).await;
+                    }
+                    if let Some((d, f)) = interrupt {
+                        should_stop |= handle_system(&mut *stage, d, f, &out).await;
+                    }
+                    if should_stop {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Run a system frame through the stage: `decide_system`, forward on `Forward`,
+/// then perform its effects. Returns `true` if the stage should stop (the frame
+/// was a `Stop`, or an effect failed fatally).
+async fn handle_system<S: Stage + ?Sized>(
+    stage: &mut S,
+    dir: Direction,
+    frame: SystemFrame,
+    out: &Outbound,
+) -> bool {
+    let mut should_stop = matches!(frame, SystemFrame::Stop);
+    let decision = stage.decide_system(dir, &frame);
+    if decision.disposition == Disposition::Forward {
+        let _ = out.send_system(dir, frame).await;
+    }
+    for effect in decision.effects {
+        if let Err(e) = stage.perform(effect, out).await {
+            let fatal = e.fatal;
+            emit_error(out, e).await;
+            should_stop |= fatal;
+        }
+    }
+    should_stop
+}
+
+/// Perform a stage's effects in order, short-circuiting on the first error.
+async fn run_effects<S: Stage + ?Sized>(
+    stage: &S,
+    effects: Vec<S::Effect>,
+    out: &Outbound,
+) -> Result<(), StageError> {
+    for effect in effects {
+        stage.perform(effect, out).await?;
+    }
+    Ok(())
+}
+
+/// Surface a `perform` failure as an `Error` system frame. v1 sends it on the
+/// downstream `sys` lane tagged [`Direction::Up`]; true upstream routing is a
+/// follow-up.
+async fn emit_error(out: &Outbound, e: StageError) {
+    let _ = out
+        .send_system(Direction::Up, SystemFrame::Error { message: e.message, fatal: e.fatal })
+        .await;
 }

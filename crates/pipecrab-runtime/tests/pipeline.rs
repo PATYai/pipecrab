@@ -1,8 +1,11 @@
 //! Run-loop behavior: interrupt barge-in, sys-preempts-data, pass-through.
 //!
 //! All deterministic and tokio-free, driven by `futures::executor::block_on`.
+//! Frames go in through the pipeline's `input` ([`Outbound`]) and come out
+//! through its `output` ([`Inbound`]) — the same abstraction every stage uses.
+//!
 //! The interrupt test parks `perform` on a `oneshot` the test never fires, so
-//! the only way `run()` can terminate is by abandoning that `perform` — the
+//! the only way the driver can terminate is by abandoning that `perform` — the
 //! test hanging would itself be the failure signal; the assertions confirm the
 //! mechanism (the receiver was dropped, and `decide_system(Interrupt)` ran).
 
@@ -16,7 +19,7 @@ use futures::future::join;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use pipecrab_core::{DataFrame, Decision, Direction, Processor, SystemFrame};
-use pipecrab_runtime::{Outbound, PipelineBuilder, PipelineEnds, Stage, StageError};
+use pipecrab_runtime::{Outbound, PipelineBuilder, Received, Stage, StageError};
 
 // --- Test 1: an Interrupt abandons an in-flight perform and runs decide_system.
 
@@ -63,17 +66,18 @@ fn interrupt_abandons_perform_and_runs_decide_system() {
             started: started_tx,
             interrupted: interrupted.clone(),
         };
-        let (ends, pipeline) = PipelineBuilder::new().stage(stage).build();
-        let PipelineEnds { mut data_in, mut sys_in, .. } = ends;
+        let (ends, driver) = PipelineBuilder::new().stage(stage).build().start();
+        let input = ends.input; // Outbound: send into the pipeline head
+        let _output = ends.output; // keep the tail's output channel open
 
         let feeder = async move {
-            data_in.send(DataFrame::Transcript("go".into())).await.unwrap();
+            input.send_data(DataFrame::Transcript("go".into())).await.unwrap();
             started_rx.next().await.expect("perform must start");
-            sys_in.send((Direction::Down, SystemFrame::Interrupt)).await.unwrap();
-            // Returning drops data_in & sys_in -> inbound closes -> the loop exits.
+            input.send_system(Direction::Down, SystemFrame::Interrupt).await.unwrap();
+            // Returning drops `input` -> head inbound closes -> the driver exits.
         };
 
-        join(feeder, pipeline.run()).await;
+        join(feeder, driver).await;
 
         assert!(interrupted.get(), "decide_system(Interrupt) must have run");
         assert!(
@@ -122,18 +126,18 @@ fn sys_preempts_backed_up_data() {
             data_count: data_count.clone(),
             data_at_interrupt: data_at_interrupt.clone(),
         };
-        let (ends, pipeline) = PipelineBuilder::new().stage(stage).build();
-        let PipelineEnds { mut data_in, mut sys_in, .. } = ends;
+        let (ends, driver) = PipelineBuilder::new().stage(stage).build().start();
+        let input = ends.input;
+        let _output = ends.output;
 
         // Back up the data lane, then enqueue an Interrupt behind it.
         for i in 0..8 {
-            data_in.send(DataFrame::Transcript(i.to_string().into())).await.unwrap();
+            input.send_data(DataFrame::Transcript(i.to_string().into())).await.unwrap();
         }
-        sys_in.send((Direction::Down, SystemFrame::Interrupt)).await.unwrap();
-        drop(data_in);
-        drop(sys_in);
+        input.send_system(Direction::Down, SystemFrame::Interrupt).await.unwrap();
+        drop(input);
 
-        pipeline.run().await;
+        driver.await;
 
         assert_eq!(
             data_at_interrupt.get(),
@@ -163,20 +167,46 @@ impl Stage for PassThrough {
 #[test]
 fn pass_through_forwards_data() {
     block_on(async {
-        let (ends, pipeline) = PipelineBuilder::new().stage(PassThrough).build();
-        let PipelineEnds { data_in, sys_in, mut data_out, sys_out: _sys_out } = ends;
+        let (ends, driver) = PipelineBuilder::new().stage(PassThrough).build().start();
+        let input = ends.input;
+        let mut output = ends.output;
 
         let feeder = async move {
-            let mut data_in = data_in;
-            let _sys_in = sys_in; // dropped with data_in at block end -> shutdown
-            data_in.send(DataFrame::Transcript("hi".into())).await.unwrap();
+            input.send_data(DataFrame::Transcript("hi".into())).await.unwrap();
+            // Dropping `input` at block end closes the head -> shutdown.
         };
 
-        join(feeder, pipeline.run()).await;
+        join(feeder, driver).await;
 
-        match data_out.next().await {
-            Some(DataFrame::Transcript(s)) => assert_eq!(&*s, "hi"),
+        match output.recv().await {
+            Some(Received::Data(DataFrame::Transcript(s))) => assert_eq!(&*s, "hi"),
             other => panic!("expected forwarded Transcript(hi), got {other:?}"),
+        }
+    });
+}
+
+// --- Test 4: a pipeline is a stage, so pipelines nest.
+
+#[test]
+fn nested_pipeline_forwards_through_both_levels() {
+    block_on(async {
+        // Inner pipeline is a single pass-through; nest it inside an outer one
+        // that also has a pass-through. A frame must traverse both levels.
+        let inner = PipelineBuilder::new().stage(PassThrough).build();
+        let (ends, driver) =
+            PipelineBuilder::new().stage(inner).stage(PassThrough).build().start();
+        let input = ends.input;
+        let mut output = ends.output;
+
+        let feeder = async move {
+            input.send_data(DataFrame::Transcript("deep".into())).await.unwrap();
+        };
+
+        join(feeder, driver).await;
+
+        match output.recv().await {
+            Some(Received::Data(DataFrame::Transcript(s))) => assert_eq!(&*s, "deep"),
+            other => panic!("expected forwarded Transcript(deep), got {other:?}"),
         }
     });
 }

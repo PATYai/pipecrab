@@ -16,5 +16,5 @@ pub mod pipeline;
 pub mod stage;
 pub use inbound::{Inbound, Received};
 pub use outbound::Outbound;
-pub use pipeline::{Pipeline, PipelineBuilder, PipelineEnds};
+pub use pipeline::{link, Pipeline, PipelineBuilder, PipelineEnds};
 pub use stage::{Stage, StageError};

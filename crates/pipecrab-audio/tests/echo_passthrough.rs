@@ -7,11 +7,9 @@
 //! Tokio-free: driven by `futures::executor::block_on`, consistent with the
 //! runtime.
 
-mod common;
-
 use async_trait::async_trait;
-use common::{MockSink, MockSource};
 use futures::executor::block_on;
+use pipecrab_audio::mock::{MockSink, MockSource};
 use pipecrab_audio::{AudioFormat, AudioSink, AudioSource};
 use pipecrab_core::{DataFrame, Direction, Processor, SystemFrame};
 use pipecrab_runtime::{Outbound, PipelineBuilder, Received, Stage, StageError};

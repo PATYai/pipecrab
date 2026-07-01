@@ -3,10 +3,9 @@
 //!
 //! [`pipecrab-core`](pipecrab_core) owns the *frame* — [`AudioChunk`] and
 //! [`AudioFormat`], re-exported here for convenience. This crate owns *how*
-//! audio crosses the pipeline edge: the [`AudioSource`] and [`AudioSink`]
-//! traits. Concrete backends (e.g. cpal for desktop) live in their own crates
-//! behind these same traits; hardware-free mock implementations live alongside
-//! this crate's tests.
+//! audio crosses the pipeline edge: the [`AudioSource`] and [`AudioSink`] traits
+//! plus hardware-free [`mock`] implementations for tests. Concrete backends
+//! (e.g. cpal for desktop) live in their own crates behind these same traits.
 //!
 //! Audio is a first-party pipeline payload — a typed
 //! [`DataFrame::Audio`](pipecrab_core::DataFrame::Audio), never a `Custom`
@@ -15,6 +14,8 @@
 #![warn(missing_docs)]
 
 use async_trait::async_trait;
+
+pub mod mock;
 
 pub use pipecrab_core::{AudioChunk, AudioFormat};
 
@@ -42,7 +43,7 @@ impl std::fmt::Display for AudioError {
 impl std::error::Error for AudioError {}
 
 /// A source of audio flowing *into* a pipeline (device capture, file, network,
-/// or a mock).
+/// or a [`mock`]).
 ///
 /// `?Send` matches pipecrab's single-threaded execution model, so one
 /// implementation runs unchanged on a current-thread executor and on `wasm32`.
@@ -56,7 +57,7 @@ pub trait AudioSource {
 }
 
 /// A sink of audio flowing *out of* a pipeline (device playback, file, network,
-/// or a mock).
+/// or a [`mock`]).
 ///
 /// `?Send` for the same reason as [`AudioSource`].
 #[async_trait(?Send)]

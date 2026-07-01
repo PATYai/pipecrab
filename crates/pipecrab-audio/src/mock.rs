@@ -1,18 +1,16 @@
-//! Hardware-free [`AudioSource`] / [`AudioSink`] fixtures shared across this
-//! crate's integration tests. Kept out of the shipped `src`: these are test
-//! scaffolding, not public API.
+//! Hardware-free [`AudioSource`] / [`AudioSink`] implementations for tests.
 //!
 //! [`MockSource`] replays a fixed script of chunks — build one straight from a
 //! ramp with [`MockSource::ramp`]. [`MockSink`] records everything it is asked
 //! to play so a test can assert on the samples that came out. No devices, no
 //! threads.
-#![allow(dead_code)] // each test binary uses only a subset of these helpers.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pipecrab_audio::{AudioChunk, AudioError, AudioFormat, AudioSink, AudioSource};
+
+use crate::{AudioChunk, AudioError, AudioFormat, AudioSink, AudioSource};
 
 /// An [`AudioSource`] that yields a predetermined list of chunks, then `None`.
 pub struct MockSource {
